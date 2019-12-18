@@ -8,6 +8,8 @@ import (
 	fmt "fmt"
 	proto "github.com/golang/protobuf/proto"
 	grpc "google.golang.org/grpc"
+	codes "google.golang.org/grpc/codes"
+	status "google.golang.org/grpc/status"
 	math "math"
 )
 
@@ -289,6 +291,17 @@ type AddServer interface {
 	Sum(context.Context, *SumRequest) (*SumReply, error)
 	// Concatenates two strings
 	Concat(context.Context, *ConcatRequest) (*ConcatReply, error)
+}
+
+// UnimplementedAddServer can be embedded to have forward compatible implementations.
+type UnimplementedAddServer struct {
+}
+
+func (*UnimplementedAddServer) Sum(ctx context.Context, req *SumRequest) (*SumReply, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Sum not implemented")
+}
+func (*UnimplementedAddServer) Concat(ctx context.Context, req *ConcatRequest) (*ConcatReply, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method Concat not implemented")
 }
 
 func RegisterAddServer(s *grpc.Server, srv AddServer) {

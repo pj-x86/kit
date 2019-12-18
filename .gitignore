@@ -1,5 +1,5 @@
-examples/addsvc/addsvc
-examples/addsvc/client/client
+examples/addsvc/cmd/addsvc/addsvc
+examples/addsvc/cmd/addcli/addcli
 examples/apigateway/apigateway
 examples/profilesvc/profilesvc
 examples/stringsvc1/stringsvc1

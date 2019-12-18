@@ -33,6 +33,9 @@ import (
 	"github.com/go-kit/kit/examples/addsvc/pkg/addservice"
 	"github.com/go-kit/kit/examples/addsvc/pkg/addtransport"
 	addthrift "github.com/go-kit/kit/examples/addsvc/thrift/gen-go/addsvc"
+
+	consulsd "github.com/go-kit/kit/sd/consul"
+	consulapi "github.com/hashicorp/consul/api"
 )
 
 func main() {
@@ -53,6 +56,7 @@ func main() {
 		zipkinBridge   = fs.Bool("zipkin-ot-bridge", false, "Use Zipkin OpenTracing bridge instead of native implementation")
 		lightstepToken = fs.String("lightstep-token", "", "Enable LightStep tracing via a LightStep access token")
 		appdashAddr    = fs.String("appdash-addr", "", "Enable Appdash tracing via an Appdash server host:port")
+		consulAddr     = fs.String("consul.addr", "127.0.0.1:8500", "Consul agent address")
 	)
 	fs.Usage = usageFor(fs, os.Args[0]+" [flags]")
 	fs.Parse(os.Args[1:])
@@ -138,6 +142,37 @@ func main() {
 		}, []string{"method", "success"})
 	}
 	http.DefaultServeMux.Handle("/metrics", promhttp.Handler())
+
+	// Service discovery domain. In this example we use Consul.
+	var client consulsd.Client
+	{
+		consulConfig := consulapi.DefaultConfig()
+		if len(*consulAddr) > 0 {
+			consulConfig.Address = *consulAddr
+		}
+		consulClient, err := consulapi.NewClient(consulConfig)
+		if err != nil {
+			logger.Log("err", err)
+			os.Exit(1)
+		}
+		client = consulsd.NewClient(consulClient)
+	}
+
+	registration := new(consulapi.AgentServiceRegistration)
+	registration.ID = "addsvc_1"
+	registration.Name = "addsvc"
+	registration.Port = 8082 //这里只向注册中心注册了 grpc 的监听端口
+	registration.Tags = []string{}
+	registration.Address = "192.168.11.5" //使用 docker 部署 consul 集群，无法配置为 127.0.0.1，暂配置为宿主机地址
+	registration.Check = &consulapi.AgentServiceCheck{
+		HTTP:                           fmt.Sprintf("http://%s:%d%s", registration.Address, 8080, "/metrics"),
+		Timeout:                        "3s",
+		Interval:                       "5s",
+		DeregisterCriticalServiceAfter: "30s", //check失败后30秒删除本服务
+	}
+
+	registrar := consulsd.NewRegistrar(client, registration, logger)
+	registrar.Register()
 
 	// Build the layers of the service "onion" from the inside out. First, the
 	// business logic service; then, the set of endpoints that wrap the service;

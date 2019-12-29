@@ -17,8 +17,10 @@ import (
 	"time"
 
 	consulsd "github.com/go-kit/kit/sd/consul"
+	"github.com/go-kit/kit/sd/eureka"
 	"github.com/gorilla/mux"
 	"github.com/hashicorp/consul/api"
+	"github.com/hudl/fargo"
 	stdopentracing "github.com/opentracing/opentracing-go"
 	stdzipkin "github.com/openzipkin/zipkin-go"
 	"google.golang.org/grpc"
@@ -38,8 +40,10 @@ func main() {
 	var (
 		httpAddr     = flag.String("http.addr", ":8000", "Address for HTTP (JSON) server")
 		consulAddr   = flag.String("consul.addr", "127.0.0.1:8500", "Consul agent address")
+		eurekaAddr   = flag.String("eureka.addr", "127.0.0.1:8761", "Eureka Server address")
 		retryMax     = flag.Int("retry.max", 3, "per-request retries to different instances")
 		retryTimeout = flag.Duration("retry.timeout", 500*time.Millisecond, "per-request timeout, including retries")
+		registryType = flag.String("registry.type", "consul", "service registry center[consul, eureka]")
 	)
 	flag.Parse()
 
@@ -51,9 +55,10 @@ func main() {
 		logger = log.With(logger, "caller", log.DefaultCaller)
 	}
 
-	// Service discovery domain. In this example we use Consul.
+	// Service discovery domain.
 	var client consulsd.Client
-	{
+	var fargoConnection fargo.EurekaConnection
+	if *registryType == "consul" {
 		consulConfig := api.DefaultConfig()
 		if len(*consulAddr) > 0 {
 			consulConfig.Address = *consulAddr
@@ -64,6 +69,13 @@ func main() {
 			os.Exit(1)
 		}
 		client = consulsd.NewClient(consulClient)
+	} else if *registryType == "eureka" {
+		eurekaURL := fmt.Sprintf("http://%s/eureka", *eurekaAddr)
+		var fargoConfig fargo.Config
+		fargoConfig.Eureka.ServiceUrls = []string{eurekaURL}
+		fargoConfig.Eureka.PollIntervalSeconds = 5
+
+		fargoConnection = fargo.NewConnFromConfig(fargoConfig)
 	}
 
 	// Transport domain.
@@ -87,8 +99,14 @@ func main() {
 			tags        = []string{}
 			passingOnly = true
 			endpoints   = addendpoint.Set{}
-			instancer   = consulsd.NewInstancer(client, logger, "addsvc", tags, passingOnly)
+			instancer   sd.Instancer
 		)
+		if *registryType == "consul" {
+			instancer = consulsd.NewInstancer(client, logger, "addsvc", tags, passingOnly)
+		} else if *registryType == "eureka" {
+			instancer = eureka.NewInstancer(&fargoConnection, "addsvc", logger)
+		}
+
 		{
 			factory := addsvcFactory(addendpoint.MakeSumEndpoint, tracer, zipkinTracer, logger)
 			endpointer := sd.NewEndpointer(instancer, factory, logger)
@@ -124,8 +142,15 @@ func main() {
 			passingOnly = true
 			uppercase   endpoint.Endpoint
 			count       endpoint.Endpoint
-			instancer   = consulsd.NewInstancer(client, logger, "stringsvc", tags, passingOnly)
+			instancer   sd.Instancer
 		)
+
+		if *registryType == "consul" {
+			instancer = consulsd.NewInstancer(client, logger, "stringsvc", tags, passingOnly)
+		} else if *registryType == "eureka" {
+			instancer = eureka.NewInstancer(&fargoConnection, "stringsvc", logger)
+		}
+
 		{
 			factory := stringsvcFactory(ctx, "GET", "/uppercase")
 			endpointer := sd.NewEndpointer(instancer, factory, logger)

@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"text/tabwriter"
 
 	"github.com/apache/thrift/lib/go/thrift"
+	"github.com/hudl/fargo"
 	lightstep "github.com/lightstep/lightstep-tracer-go"
 	"github.com/oklog/oklog/pkg/group"
 	stdopentracing "github.com/opentracing/opentracing-go"
@@ -35,6 +37,7 @@ import (
 	addthrift "github.com/go-kit/kit/examples/addsvc/thrift/gen-go/addsvc"
 
 	consulsd "github.com/go-kit/kit/sd/consul"
+	"github.com/go-kit/kit/sd/eureka"
 	consulapi "github.com/hashicorp/consul/api"
 )
 
@@ -44,9 +47,9 @@ func main() {
 	// on, but we do it here for demonstration purposes.
 	fs := flag.NewFlagSet("addsvc", flag.ExitOnError)
 	var (
-		debugAddr      = fs.String("debug.addr", ":8080", "Debug and metrics listen address")
-		httpAddr       = fs.String("http-addr", ":8081", "HTTP listen address")
-		grpcAddr       = fs.String("grpc-addr", ":8082", "gRPC listen address")
+		debugAddr      = fs.Int("debug.addr", 8080, "Debug and metrics listen address")
+		httpAddr       = fs.Int("http-addr", 8081, "HTTP listen address")
+		grpcAddr       = fs.Int("grpc-addr", 8082, "gRPC listen address")
 		thriftAddr     = fs.String("thrift-addr", ":8083", "Thrift listen address")
 		jsonRPCAddr    = fs.String("jsonrpc-addr", ":8084", "JSON RPC listen address")
 		thriftProtocol = fs.String("thrift-protocol", "binary", "binary, compact, json, simplejson")
@@ -56,7 +59,10 @@ func main() {
 		zipkinBridge   = fs.Bool("zipkin-ot-bridge", false, "Use Zipkin OpenTracing bridge instead of native implementation")
 		lightstepToken = fs.String("lightstep-token", "", "Enable LightStep tracing via a LightStep access token")
 		appdashAddr    = fs.String("appdash-addr", "", "Enable Appdash tracing via an Appdash server host:port")
+		registryType   = fs.String("registry.type", "consul", "service registry center[consul, eureka]")
 		consulAddr     = fs.String("consul.addr", "127.0.0.1:8500", "Consul agent address")
+		eurekaAddr     = fs.String("eureka.addr", "127.0.0.1:8761", "Eureka Server address")
+		appIP          = fs.String("app.ip", "192.168.11.5", "application ip")
 	)
 	fs.Usage = usageFor(fs, os.Args[0]+" [flags]")
 	fs.Parse(os.Args[1:])
@@ -143,36 +149,64 @@ func main() {
 	}
 	http.DefaultServeMux.Handle("/metrics", promhttp.Handler())
 
-	// Service discovery domain. In this example we use Consul.
-	var client consulsd.Client
-	{
-		consulConfig := consulapi.DefaultConfig()
-		if len(*consulAddr) > 0 {
-			consulConfig.Address = *consulAddr
+	// Service discovery domain.
+	if *registryType == "consul" {
+		var client consulsd.Client
+		{
+			consulConfig := consulapi.DefaultConfig()
+			if len(*consulAddr) > 0 {
+				consulConfig.Address = *consulAddr
+			}
+			consulClient, err := consulapi.NewClient(consulConfig)
+			if err != nil {
+				logger.Log("err", err)
+				os.Exit(1)
+			}
+			client = consulsd.NewClient(consulClient)
 		}
-		consulClient, err := consulapi.NewClient(consulConfig)
-		if err != nil {
-			logger.Log("err", err)
-			os.Exit(1)
+
+		registration := new(consulapi.AgentServiceRegistration)
+		registration.ID = "addsvc_1"
+		registration.Name = "addsvc"
+		registration.Port = *grpcAddr //这里只向注册中心注册了 grpc 的监听端口
+		registration.Tags = []string{}
+		registration.Address = *appIP //使用 docker 部署 consul 集群，无法配置为 127.0.0.1，暂配置为宿主机地址
+		registration.Check = &consulapi.AgentServiceCheck{
+			HTTP:                           fmt.Sprintf("http://%s:%d%s", registration.Address, *debugAddr, "/metrics"),
+			Timeout:                        "3s",
+			Interval:                       "5s",
+			DeregisterCriticalServiceAfter: "30s", //check失败后30秒删除本服务
 		}
-		client = consulsd.NewClient(consulClient)
-	}
 
-	registration := new(consulapi.AgentServiceRegistration)
-	registration.ID = "addsvc_1"
-	registration.Name = "addsvc"
-	registration.Port = 8082 //这里只向注册中心注册了 grpc 的监听端口
-	registration.Tags = []string{}
-	registration.Address = "192.168.11.5" //使用 docker 部署 consul 集群，无法配置为 127.0.0.1，暂配置为宿主机地址
-	registration.Check = &consulapi.AgentServiceCheck{
-		HTTP:                           fmt.Sprintf("http://%s:%d%s", registration.Address, 8080, "/metrics"),
-		Timeout:                        "3s",
-		Interval:                       "5s",
-		DeregisterCriticalServiceAfter: "30s", //check失败后30秒删除本服务
-	}
+		registrar := consulsd.NewRegistrar(client, registration, logger)
+		registrar.Register()
+		defer registrar.Deregister()
+	} else if *registryType == "eureka" {
+		eurekaURL := fmt.Sprintf("http://%s/eureka", *eurekaAddr)
+		var fargoConfig fargo.Config
+		fargoConfig.Eureka.ServiceUrls = []string{eurekaURL}
+		// 订阅服务器应轮询更新的频率
+		fargoConfig.Eureka.PollIntervalSeconds = 30
 
-	registrar := consulsd.NewRegistrar(client, registration, logger)
-	registrar.Register()
+		instance := &fargo.Instance{
+			HostName:         *appIP + ":" + strconv.Itoa(*grpcAddr),
+			Port:             *grpcAddr, //这里只向注册中心注册了 grpc 的监听端口
+			PortEnabled:      true,
+			App:              "addsvc",
+			IPAddr:           *appIP,
+			VipAddress:       *appIP,
+			HealthCheckUrl:   fmt.Sprintf("http://%s:%d%s", *appIP, *debugAddr, "/metrics"),
+			Status:           fargo.UP,
+			Overriddenstatus: fargo.UP,
+			DataCenterInfo:   fargo.DataCenterInfo{Name: fargo.MyOwn},
+			LeaseInfo:        fargo.LeaseInfo{RenewalIntervalInSecs: 30, DurationInSecs: 90},
+		}
+		fargoConnection := fargo.NewConnFromConfig(fargoConfig)
+		registrar := eureka.NewRegistrar(&fargoConnection, instance, logger)
+
+		registrar.Register()
+		defer registrar.Deregister()
+	}
 
 	// Build the layers of the service "onion" from the inside out. First, the
 	// business logic service; then, the set of endpoints that wrap the service;
@@ -206,13 +240,13 @@ func main() {
 		// The debug listener mounts the http.DefaultServeMux, and serves up
 		// stuff like the Prometheus metrics route, the Go debug and profiling
 		// routes, and so on.
-		debugListener, err := net.Listen("tcp", *debugAddr)
+		debugListener, err := net.Listen("tcp", ":"+strconv.Itoa(*debugAddr))
 		if err != nil {
 			logger.Log("transport", "debug/HTTP", "during", "Listen", "err", err)
 			os.Exit(1)
 		}
 		g.Add(func() error {
-			logger.Log("transport", "debug/HTTP", "addr", *debugAddr)
+			logger.Log("transport", "debug/HTTP", "addr", ":"+strconv.Itoa(*debugAddr))
 			return http.Serve(debugListener, http.DefaultServeMux)
 		}, func(error) {
 			debugListener.Close()
@@ -220,13 +254,13 @@ func main() {
 	}
 	{
 		// The HTTP listener mounts the Go kit HTTP handler we created.
-		httpListener, err := net.Listen("tcp", *httpAddr)
+		httpListener, err := net.Listen("tcp", ":"+strconv.Itoa(*httpAddr))
 		if err != nil {
 			logger.Log("transport", "HTTP", "during", "Listen", "err", err)
 			os.Exit(1)
 		}
 		g.Add(func() error {
-			logger.Log("transport", "HTTP", "addr", *httpAddr)
+			logger.Log("transport", "HTTP", "addr", ":"+strconv.Itoa(*httpAddr))
 			return http.Serve(httpListener, httpHandler)
 		}, func(error) {
 			httpListener.Close()
@@ -234,13 +268,13 @@ func main() {
 	}
 	{
 		// The gRPC listener mounts the Go kit gRPC server we created.
-		grpcListener, err := net.Listen("tcp", *grpcAddr)
+		grpcListener, err := net.Listen("tcp", ":"+strconv.Itoa(*grpcAddr))
 		if err != nil {
 			logger.Log("transport", "gRPC", "during", "Listen", "err", err)
 			os.Exit(1)
 		}
 		g.Add(func() error {
-			logger.Log("transport", "gRPC", "addr", *grpcAddr)
+			logger.Log("transport", "gRPC", "addr", ":"+strconv.Itoa(*grpcAddr))
 			// we add the Go Kit gRPC Interceptor to our gRPC service as it is used by
 			// the here demonstrated zipkin tracing middleware.
 			baseServer := grpc.NewServer(grpc.UnaryInterceptor(kitgrpc.Interceptor))

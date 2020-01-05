@@ -13,6 +13,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 
 	"github.com/go-kit/kit/log"
+	logzap "github.com/go-kit/kit/log/zap"
+	"go.uber.org/zap"
+
 	kitprometheus "github.com/go-kit/kit/metrics/prometheus"
 	httptransport "github.com/go-kit/kit/transport/http"
 
@@ -33,7 +36,15 @@ func main() {
 	flag.Parse()
 
 	var logger log.Logger
-	logger = log.NewLogfmtLogger(os.Stderr)
+	var zapLogger *zap.Logger
+	var atomLevel zap.AtomicLevel //日志输出级别，可动态修改
+	var env string = "dev"        //dev-开发, test-测试, prod-生产
+
+	atomLevel = zap.NewAtomicLevelAt(zap.InfoLevel)               //默认 Info 日志级别
+	zapLogger = logzap.NewZapLogger(env, "./test.log", atomLevel) //默认创建性能最佳的 Logger 对象，对性能有要求的场景下可以使用它，仅支持结构化日志输出
+
+	logger = logzap.NewZapSugarLogger(zapLogger, atomLevel.Level())
+	//logger = log.NewLogfmtLogger(os.Stderr)
 	logger = log.With(logger, "listen", ":"+strconv.Itoa(*listen), "caller", log.DefaultCaller)
 
 	fieldKeys := []string{"method", "error"}
@@ -131,6 +142,13 @@ func main() {
 		encodeResponse,
 	)
 
+	/* 启用动态修改日志级别的 HTTP 接口
+	 * 使用方法：
+	 * curl http://localhost:8080/log/level  #获取当前日志级别
+	 * curl -XPUT --data '{"level":"debug"}' http://localhost:8080/log/level  #修改日志级别为 debug
+	 * 支持的日志级别: debug, info, warn, error, panic, fatal
+	 */
+	http.HandleFunc("/log/level", atomLevel.ServeHTTP)
 	http.Handle("/uppercase", uppercaseHandler)
 	http.Handle("/count", countHandler)
 	http.Handle("/metrics", promhttp.Handler())
